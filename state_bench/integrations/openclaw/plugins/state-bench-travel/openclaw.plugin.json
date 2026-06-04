@@ -1,0 +1,41 @@
+{
+  "id": "state-bench-travel",
+  "name": "STATE-Bench Travel Tools",
+  "description": "Travel domain tools for STATE-Bench evaluation",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "tool_server_url": {
+        "type": "string",
+        "description": "URL of the tool execution server",
+        "default": "http://127.0.0.1:8765"
+      }
+    },
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "search_flights",
+      "get_user_details",
+      "get_user_reservations",
+      "get_booking",
+      "get_flight_status",
+      "get_policies",
+      "create_booking",
+      "update_booking",
+      "cancel_booking",
+      "search_hotels",
+      "book_hotel",
+      "get_hotel_reservation",
+      "cancel_hotel_reservation",
+      "search_car_rentals",
+      "book_car_rental",
+      "get_car_rental",
+      "cancel_car_rental"
+    ]
+  }
+}
