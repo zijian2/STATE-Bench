@@ -65,20 +65,32 @@ def setup_logging(log_dir: Path, task_id: str) -> Path:
     return log_file
 
 
-def load_task_into_server(task_file: Path) -> dict:
+def load_task_into_server(task_file: Path, session_key: str | None = None) -> dict:
+    headers = {"X-Session-Id": session_key} if session_key else {}
     response = requests.post(
         f"{TOOL_SERVER_URL}/load_task",
         json={"task_file": str(task_file)},
+        headers=headers,
         timeout=30,
     )
     response.raise_for_status()
     return response.json()
 
 
-def get_server_snapshot() -> dict:
-    response = requests.get(f"{TOOL_SERVER_URL}/snapshot", timeout=30)
+def get_server_snapshot(session_key: str | None = None) -> dict:
+    headers = {"X-Session-Id": session_key} if session_key else {}
+    response = requests.get(
+        f"{TOOL_SERVER_URL}/snapshot",
+        headers=headers,
+        timeout=30,
+    )
     response.raise_for_status()
     return response.json().get("snapshot", {})
+
+
+def clear_server_session(session_key: str) -> None:
+    """Release the per-session task environment on the tool server (no-op for serial runs)."""
+    pass
 
 
 def call_openclaw_agent(
@@ -91,17 +103,21 @@ def call_openclaw_agent(
         "openclaw", "agent",
         "--local",
         "--agent", agent_id,
-        "--session-key", session_key,
+        "--session-id", session_key,
         "--json",
         "-m", message,
     ]
     logger.debug("openclaw cmd: %s", " ".join(cmd[:-1]) + f" '<{len(message)} chars>'")
+    # Pass session id via environment so the state-bench plugin can include it
+    # in the X-Session-Id header when calling the tool server.
+    env = {**os.environ, "STATE_BENCH_SESSION_ID": session_key}
     t0 = time.monotonic()
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         timeout=AGENT_TIMEOUT_SECONDS,
+        env=env,
     )
     elapsed = time.monotonic() - t0
     if result.returncode != 0:
@@ -169,14 +185,18 @@ def run_task(
         "total_seconds": 0.0,
     }
 
-    # 1. Load task into tool server
+    # 0. Generate unique session key first (used for tool server isolation + agent)
+    session_key = f"sb-{task.task_id}-{uuid.uuid4().hex[:8]}".replace("_", "-")[:64]
+    logger.info("Session key: %s", session_key)
+
+    # 1. Load task into tool server (per-session isolation for parallel runs)
     t = time.monotonic()
-    server_status = load_task_into_server(task_file)
+    server_status = load_task_into_server(task_file, session_key=session_key)
     timings["load_task_seconds"] = round(time.monotonic() - t, 3)
     logger.info("Tool server loaded task: %s (%.2fs)", server_status, timings["load_task_seconds"])
 
     # 1b. Snapshot environment BEFORE the agent runs (for state-diff scoring).
-    snapshot_before = get_server_snapshot()
+    snapshot_before = get_server_snapshot(session_key=session_key)
 
     # 2. Build user simulator
     domain = get_domain_config(domain_name)
@@ -189,15 +209,15 @@ def run_task(
     )
     logger.debug("Simulator system prompt: %d chars", len(sim_prompt))
 
-    # 3. Unique session for this task
-    session_key = f"agent:{agent_id}:state-bench-{task.task_id}-{uuid.uuid4().hex[:8]}"
-    logger.info("Session key: %s", session_key)
-
     # 4. Conversation loop
+    # Prepend task context to the opening message for agent awareness
+    task_context = f"[Task: {task.task_id} | User: {task.user_id}]\n\n"
+    opening_with_context = task_context + task.opening_message
+    
     conversation_log: list[dict[str, Any]] = [{"role": "user", "content": task.opening_message}]
     logger.info("[user opening] %s", task.opening_message[:200])
 
-    user_message = task.opening_message
+    user_message = opening_with_context  # Agent sees context, simulator log stays clean
     final_session_file: str | None = None
     terminated = False
     last_error: str | None = None
@@ -292,6 +312,8 @@ def run_task(
     logger.info("Total wall time: %.1fs across %d turns", timings["total_seconds"], completed_turns)
 
     if last_error:
+        # Release tool server session on error
+        clear_server_session(session_key)
         return {
             "status": "ERR",
             "task_id": task.task_id,
@@ -302,11 +324,13 @@ def run_task(
 
     # 5. Parse trajectory
     if not final_session_file:
+        clear_server_session(session_key)
         return {"status": "ERR", "task_id": task.task_id, "error": "no session file"}
 
     trajectory_path = Path(final_session_file.replace(".jsonl", ".trajectory.jsonl"))
     logger.info("Trajectory: %s", trajectory_path)
     if not trajectory_path.exists():
+        clear_server_session(session_key)
         return {"status": "ERR", "task_id": task.task_id, "error": f"trajectory missing: {trajectory_path}"}
 
     parse_t0 = time.monotonic()
@@ -317,7 +341,7 @@ def run_task(
     timings["parse_seconds"] = round(time.monotonic() - parse_t0, 3)
 
     # Snapshot environment AFTER and compute state diff for scoring.
-    snapshot_after = get_server_snapshot()
+    snapshot_after = get_server_snapshot(session_key=session_key)
     from state_bench.schemas import StateDiff
     state_diff = StateDiff.compute(snapshot_before, snapshot_after)
 
@@ -355,6 +379,9 @@ def run_task(
     with open(task_output_dir / "timings.json", "w") as f:
         json.dump(timings, f, indent=2)
 
+    # Release tool server session resources
+    clear_server_session(session_key)
+
     return {
         "status": "OK",
         "task_id": task.task_id,
@@ -370,7 +397,7 @@ def run_task(
 def main():
     parser = argparse.ArgumentParser(description="Run STATE-Bench evaluation via OpenClaw")
     parser.add_argument("--domain", type=str, default="travel")
-    parser.add_argument("--tasks", type=str, required=True, help="Comma-separated task IDs")
+    parser.add_argument("--tasks", type=str, default=None, help="Comma-separated task IDs (omit to run all tasks in domain)")
     parser.add_argument("--memory", action="store_true", help="Enable OpenClaw memory")
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--log-dir", type=str, default=None, help="Log directory (default: <output-dir>/../logs)")
@@ -393,7 +420,14 @@ def main():
     log_dir = Path(args.log_dir).resolve() if args.log_dir else output_dir.parent.parent / "logs"
 
     tasks_dir = domain_tasks_dir(args.domain)
-    task_ids = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    if args.tasks:
+        task_ids = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    else:
+        # Run all tasks in domain when --tasks is omitted
+        task_ids = sorted(
+            f.stem for f in tasks_dir.glob("*.json")
+        )
+        print(f"No --tasks specified, running all {len(task_ids)} tasks in {args.domain}")
     task_files = []
     for tid in task_ids:
         tf = tasks_dir / f"{tid}.json"
@@ -420,7 +454,8 @@ def main():
     # Optional scoring
     if args.score:
         from .scorer import AnthropicJudgeClient, score_trajectory
-        judge = AnthropicJudgeClient(api_key=api_key)
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        judge = AnthropicJudgeClient(api_key=api_key, base_url=base_url)
         for result in results:
             if result["status"] != "OK":
                 continue

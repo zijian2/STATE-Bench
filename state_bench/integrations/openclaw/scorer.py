@@ -25,8 +25,8 @@ class AnthropicJudgeClient:
     Exposes `complete_json(prompt, system_prompt, max_tokens, reasoning_effort) -> dict`.
     """
 
-    def __init__(self, api_key: str, model: str = "claude-opus-4-7"):
-        self.client = Anthropic(api_key=api_key)
+    def __init__(self, api_key: str, model: str = "claude-opus-4-7", base_url: str | None = None):
+        self.client = Anthropic(api_key=api_key, base_url=base_url)
         self.model = model
 
     def complete_json(
