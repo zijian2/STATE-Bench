@@ -82,7 +82,7 @@ Main orchestration loop that:
 
 1. Install STATE-Bench plugin:
 ```bash
-cd openclaw-eval/plugins/state-bench-travel
+cd ./state_bench/integrations/openclaw/plugins/state-bench-travel
 openclaw plugins install --link .
 openclaw gateway restart
 ```
@@ -95,29 +95,26 @@ openclaw config set agents.list[0].tools.alsoAllow '["search_flights","get_user_
 
 3. Install Python dependencies:
 ```bash
-pip install fastapi uvicorn anthropic
+export ANTHROPIC_API_KEY=*** -c "import json; cfg=json.load(open('/root/.openclaw/openclaw.json')); print(cfg['models']['providers']['claude']['apiKey'])")
+export ANTHROPIC_BASE_URL="http://one.iflytek.com/api/llm/console/chat"
+uv sync --index https://pypi.tuna.tsinghua.edu.cn/simple --extra openclaw
 ```
 
 ## Usage (Planned)
 
 ```bash
-# Run with memory enabled
-python runner.py \
-  --domain travel \
-  --tasks task_001,task_002 \
-  --memory \
-  --output-dir outputs/travel-memory-on
+uv run python -m state_bench.integrations.openclaw.tool_server > /tmp/tool_server.log 2>&1
+uv run python -m state_bench.integrations.openclaw.runner \
+  --score \
+  --tasks task_001 \
+  --agent-id state-bench \
+  --output-dir outputs/travel-full-vector
 
-# Run with memory disabled
-python runner.py \
-  --domain travel \
-  --tasks task_001,task_002 \
-  --output-dir outputs/travel-memory-off
-
-# Compare results
-python compare_results.py \
-  --baseline outputs/travel-memory-off \
-  --treatment outputs/travel-memory-on
+nohup uv run python -m state_bench.integrations.openclaw.runner \
+--score \
+--agent-id state-bench \
+--output-dir outputs/travel-full-vector \
+> /tmp/state_bench_runner.log 2>&1 &
 ```
 
 ## Status

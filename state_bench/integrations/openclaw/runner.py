@@ -394,6 +394,109 @@ def run_task(
     }
 
 
+def write_summary(
+    output_dir: Path,
+    results: list[dict],
+    overall_seconds: float,
+    memory_enabled: bool,
+) -> Path:
+    """Write/overwrite summary.json with current results (called incrementally)."""
+    summary_file = output_dir / "summary.json"
+    with open(summary_file, "w") as f:
+        json.dump({
+            "memory_enabled": memory_enabled,
+            "overall_seconds": round(overall_seconds, 3),
+            "results": results,
+        }, f, indent=2)
+    return summary_file
+
+
+def score_one(
+    result: dict,
+    judge,
+    tasks_dir: Path,
+    domain_name: str,
+) -> dict:
+    """Score a single trajectory in-place. Returns the updated result."""
+    if result.get("status") != "OK":
+        return result
+    if "score" in result and result["score"].get("status") == "OK":
+        return result  # already scored
+    from .scorer import score_trajectory
+    traj_file = Path(result["trajectory_file"])
+    task_file = tasks_dir / f"{result['task_id']}.json"
+    t = time.monotonic()
+    score_result = score_trajectory(traj_file, task_file, judge, domain_name)
+    score_result["scoring_seconds"] = round(time.monotonic() - t, 3)
+    result["score"] = score_result
+    return result
+
+
+def format_result_line(r: dict) -> str:
+    """Render a single result line for the summary table."""
+    line = f"  {r['task_id']}: {r['status']}"
+    if r["status"] == "OK":
+        m = r.get("metrics", {})
+        t = r.get("timings", {})
+        line += (
+            f" turns={m.get('turns', '?')}"
+            f" tools={m.get('tool_calls', '?')}"
+            f" errs={m.get('tool_errors', '?')}"
+            f" ({t.get('total_seconds', 0):.1f}s)"
+        )
+        if "score" in r and r["score"].get("status") == "OK":
+            ux = r["score"].get("ux_score")
+            if ux is not None:
+                line += f" ux={ux:.2f}"
+    else:
+        line += f" — {r.get('error', '?')}"
+    return line
+
+
+def discover_existing_results(output_dir: Path) -> list[dict]:
+    """Build minimal result dicts from trajectory files already on disk.
+
+    Used by --score-only mode to score previously-run tasks without re-running them.
+    Loads existing summary.json results when present so prior scores/metrics survive.
+    """
+    summary_file = output_dir / "summary.json"
+    if summary_file.exists():
+        try:
+            with open(summary_file) as f:
+                data = json.load(f)
+            if isinstance(data.get("results"), list):
+                return data["results"]
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Fallback: scan task directories for trajectory.json
+    results = []
+    for task_dir in sorted(output_dir.iterdir()):
+        if not task_dir.is_dir():
+            continue
+        traj_file = task_dir / "trajectory.json"
+        if not traj_file.exists():
+            continue
+        try:
+            with open(traj_file) as f:
+                traj = json.load(f)
+            results.append({
+                "status": "OK",
+                "task_id": traj.get("task_id", task_dir.name),
+                "trajectory_file": str(traj_file),
+                "metrics": traj.get("metrics", {}),
+                "token_usage": traj.get("token_usage", {}),
+                "timings": traj.get("timings", {}),
+            })
+        except (json.JSONDecodeError, OSError) as e:
+            results.append({
+                "status": "ERR",
+                "task_id": task_dir.name,
+                "error": f"failed to load trajectory: {e}",
+            })
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run STATE-Bench evaluation via OpenClaw")
     parser.add_argument("--domain", type=str, default="travel")
@@ -402,24 +505,71 @@ def main():
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--log-dir", type=str, default=None, help="Log directory (default: <output-dir>/../logs)")
     parser.add_argument("--agent-id", type=str, default="main")
-    parser.add_argument("--score", action="store_true", help="Score trajectories after run")
+    parser.add_argument("--score", action="store_true", help="Score each trajectory immediately after the task finishes (incremental)")
+    parser.add_argument("--score-only", action="store_true", help="Skip task execution; score existing trajectories in --output-dir and update summary.json. Resumes by skipping tasks that already have a successful score.")
+    parser.add_argument("--rescore", action="store_true", help="With --score-only: re-score even tasks that already have a recorded score.")
     args = parser.parse_args()
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         parser.error("ANTHROPIC_API_KEY environment variable required")
 
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = Path(args.log_dir).resolve() if args.log_dir else output_dir.parent.parent / "logs"
+    tasks_dir = domain_tasks_dir(args.domain)
+
+    # ---- score-only mode: don't run tasks, just score existing trajectories ----
+    if args.score_only:
+        from .scorer import AnthropicJudgeClient
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        judge = AnthropicJudgeClient(api_key=api_key, base_url=base_url)
+
+        results = discover_existing_results(output_dir)
+        if not results:
+            parser.error(f"No trajectories found under {output_dir} to score.")
+
+        if args.tasks:
+            wanted = {t.strip() for t in args.tasks.split(",") if t.strip()}
+            results = [r for r in results if r.get("task_id") in wanted]
+            if not results:
+                parser.error(f"None of the requested tasks have trajectories under {output_dir}.")
+
+        print(f"[score-only] scoring {len(results)} trajectories from {output_dir}")
+        overall_t0 = time.monotonic()
+
+        for i, result in enumerate(results, 1):
+            if not args.rescore and "score" in result and result["score"].get("status") == "OK":
+                print(f"  [{i}/{len(results)}] {result['task_id']}: skip (already scored)")
+                continue
+            if result.get("status") != "OK":
+                print(f"  [{i}/{len(results)}] {result['task_id']}: skip ({result.get('error', 'not OK')})")
+                continue
+            # drop any prior failed score so score_one will retry
+            if args.rescore or ("score" in result and result["score"].get("status") != "OK"):
+                result.pop("score", None)
+            try:
+                score_one(result, judge, tasks_dir, args.domain)
+            except Exception as e:
+                result["score"] = {"status": "ERR", "error": str(e)}
+            line = format_result_line(result)
+            print(f"  [{i}/{len(results)}]{line[2:]}")
+            # Incremental write so progress survives crashes
+            elapsed = time.monotonic() - overall_t0
+            write_summary(output_dir, results, elapsed, args.memory)
+
+        overall_seconds = time.monotonic() - overall_t0
+        summary_file = write_summary(output_dir, results, overall_seconds, args.memory)
+        print(f"\n[summary] {summary_file}")
+        return
+
+    # ---- normal run mode ----
     try:
         health = requests.get(f"{TOOL_SERVER_URL}/health", timeout=5).json()
         print(f"[health] {health}")
     except Exception as e:
         parser.error(f"Tool server not reachable at {TOOL_SERVER_URL}: {e}")
 
-    output_dir = Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    log_dir = Path(args.log_dir).resolve() if args.log_dir else output_dir.parent.parent / "logs"
-
-    tasks_dir = domain_tasks_dir(args.domain)
     if args.tasks:
         task_ids = [t.strip() for t in args.tasks.split(",") if t.strip()]
     else:
@@ -435,9 +585,16 @@ def main():
             parser.error(f"Task file not found: {tf}")
         task_files.append(tf)
 
+    # Lazily build the judge only if --score is on, so a missing key doesn't break runs
+    judge = None
+    if args.score:
+        from .scorer import AnthropicJudgeClient
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        judge = AnthropicJudgeClient(api_key=api_key, base_url=base_url)
+
     overall_t0 = time.monotonic()
     results = []
-    for task_file in task_files:
+    for i, task_file in enumerate(task_files, 1):
         result = run_task(
             task_file=task_file,
             output_dir=output_dir,
@@ -447,50 +604,32 @@ def main():
             agent_id=args.agent_id,
             domain_name=args.domain,
         )
+
+        # Score immediately so progress is captured even if a later task crashes
+        if args.score and result.get("status") == "OK":
+            try:
+                score_one(result, judge, tasks_dir, args.domain)
+            except Exception as e:
+                result["score"] = {"status": "ERR", "error": str(e)}
+
         results.append(result)
+        line = format_result_line(result)
+        print(f"[{i}/{len(task_files)}]{line[2:]}")
+
+        # Incremental write after every task
+        elapsed = time.monotonic() - overall_t0
+        write_summary(output_dir, results, elapsed, args.memory)
 
     overall_seconds = time.monotonic() - overall_t0
 
-    # Optional scoring
-    if args.score:
-        from .scorer import AnthropicJudgeClient, score_trajectory
-        base_url = os.environ.get("ANTHROPIC_BASE_URL")
-        judge = AnthropicJudgeClient(api_key=api_key, base_url=base_url)
-        for result in results:
-            if result["status"] != "OK":
-                continue
-            traj_file = Path(result["trajectory_file"])
-            task_file = tasks_dir / f"{result['task_id']}.json"
-            t = time.monotonic()
-            score_result = score_trajectory(traj_file, task_file, judge, args.domain)
-            score_result["scoring_seconds"] = round(time.monotonic() - t, 3)
-            result["score"] = score_result
-
-    # Summary
+    # Final summary banner
     print(f"\n{'='*60}\nSummary\n{'='*60}")
     ok = sum(1 for r in results if r["status"] == "OK")
     print(f"OK: {ok}/{len(results)}  Wall: {overall_seconds:.1f}s")
     for r in results:
-        line = f"  {r['task_id']}: {r['status']}"
-        if r["status"] == "OK":
-            m = r["metrics"]
-            t = r["timings"]
-            line += f" turns={m['turns']} tools={m['tool_calls']} errs={m['tool_errors']} ({t['total_seconds']:.1f}s)"
-            if "score" in r and r["score"].get("status") == "OK":
-                ux = r["score"].get("ux_score")
-                if ux is not None:
-                    line += f" ux={ux:.2f}"
-        else:
-            line += f" — {r.get('error', '?')}"
-        print(line)
+        print(format_result_line(r))
 
-    summary_file = output_dir / "summary.json"
-    with open(summary_file, "w") as f:
-        json.dump({
-            "memory_enabled": args.memory,
-            "overall_seconds": round(overall_seconds, 3),
-            "results": results,
-        }, f, indent=2)
+    summary_file = write_summary(output_dir, results, overall_seconds, args.memory)
     print(f"\n[summary] {summary_file}")
     print(f"[logs] {log_dir}")
 
