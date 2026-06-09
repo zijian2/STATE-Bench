@@ -153,6 +153,12 @@ python -m state_bench.integrations.openclaw.runner \
   --memory --score \
   --agent-id state-bench \
   --output-dir outputs/travel-full-vector
+
+nohup uv run python -m state_bench.integrations.openclaw.runner \
+--score \
+--agent-id state-bench \
+--output-dir outputs/travel-full-vector \
+> /tmp/state_bench_runner.log 2>&1 &
 ```
 
 **Run specific tasks:**

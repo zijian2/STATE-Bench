@@ -18,7 +18,6 @@ from typing import Any
 import requests
 
 from state_bench.schemas import TaskDefinition
-from state_bench.domains.travel.simulator import build_simulator_prompt
 from state_bench.env_loader import load_task_environment
 from state_bench.domain import get_domain_config
 from state_bench.paths import domain_tasks_dir
@@ -201,7 +200,7 @@ def run_task(
     # 2. Build user simulator
     domain = get_domain_config(domain_name)
     env_data, _ = load_task_environment(domain, task)
-    sim_prompt = build_simulator_prompt(task, env_data, task.user_id)
+    sim_prompt = domain.build_simulator_prompt(task, env_data, task.user_id)
     simulator = UserSimulator(
         api_key=anthropic_api_key,
         system_prompt=sim_prompt,
@@ -362,6 +361,7 @@ def run_task(
         "token_usage": token_usage,
         "state_diff": state_diff.to_dict(),
         "metadata": {
+            "domain": domain_name,
             "memory_enabled": memory_enabled,
             "agent_id": agent_id,
             "session_key": session_key,
@@ -497,9 +497,37 @@ def discover_existing_results(output_dir: Path) -> list[dict]:
     return results
 
 
+def _infer_domain_from_task_id(task_id: str, output_dir: Path) -> str:
+    """Infer domain from task metadata or fallback to 'travel'.
+    
+    Used by score-only mode when domain is not explicitly provided.
+    Tries to load the trajectory file and extract domain from metadata.
+    """
+    traj_file = output_dir / task_id / "trajectory.json"
+    if traj_file.exists():
+        try:
+            with open(traj_file) as f:
+                traj = json.load(f)
+            # Check if metadata has domain info (would need to be added during run_task)
+            domain = traj.get("metadata", {}).get("domain")
+            if domain:
+                return domain
+        except (json.JSONDecodeError, OSError):
+            pass
+    
+    # Fallback: try to match task_id against all domain task directories
+    for candidate in ["travel", "customer_support", "shopping_assistant"]:
+        tasks_dir = domain_tasks_dir(candidate)
+        if (tasks_dir / f"{task_id}.json").exists():
+            return candidate
+    
+    # Ultimate fallback
+    return "travel"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run STATE-Bench evaluation via OpenClaw")
-    parser.add_argument("--domain", type=str, default="travel")
+    parser.add_argument("--domain", type=str, default=None, help="Domain to run (travel, customer_support, shopping_assistant, or 'all'). Omit or use 'all' to run all three domains.")
     parser.add_argument("--tasks", type=str, default=None, help="Comma-separated task IDs (omit to run all tasks in domain)")
     parser.add_argument("--memory", action="store_true", help="Enable OpenClaw memory")
     parser.add_argument("--output-dir", type=str, required=True)
@@ -517,7 +545,19 @@ def main():
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     log_dir = Path(args.log_dir).resolve() if args.log_dir else output_dir.parent.parent / "logs"
-    tasks_dir = domain_tasks_dir(args.domain)
+    
+    # Determine which domains to run
+    if args.domain is None or args.domain == "all":
+        domains_to_run = ["travel", "customer_support", "shopping_assistant"]
+        print(f"Running all domains: {', '.join(domains_to_run)}")
+    else:
+        domains_to_run = [args.domain]
+    
+    # Validate domains
+    valid_domains = {"travel", "customer_support", "shopping_assistant"}
+    for domain in domains_to_run:
+        if domain not in valid_domains:
+            parser.error(f"Invalid domain: {domain}. Must be one of: {', '.join(valid_domains)}, or 'all'")
 
     # ---- score-only mode: don't run tasks, just score existing trajectories ----
     if args.score_only:
@@ -545,11 +585,15 @@ def main():
             if result.get("status") != "OK":
                 print(f"  [{i}/{len(results)}] {result['task_id']}: skip ({result.get('error', 'not OK')})")
                 continue
+            # Infer domain from task_id prefix or trajectory metadata
+            task_id = result.get("task_id", "")
+            domain_for_task = _infer_domain_from_task_id(task_id, output_dir)
+            tasks_dir_for_task = domain_tasks_dir(domain_for_task)
             # drop any prior failed score so score_one will retry
             if args.rescore or ("score" in result and result["score"].get("status") != "OK"):
                 result.pop("score", None)
             try:
-                score_one(result, judge, tasks_dir, args.domain)
+                score_one(result, judge, tasks_dir_for_task, domain_for_task)
             except Exception as e:
                 result["score"] = {"status": "ERR", "error": str(e)}
             line = format_result_line(result)
@@ -570,20 +614,32 @@ def main():
     except Exception as e:
         parser.error(f"Tool server not reachable at {TOOL_SERVER_URL}: {e}")
 
-    if args.tasks:
-        task_ids = [t.strip() for t in args.tasks.split(",") if t.strip()]
-    else:
-        # Run all tasks in domain when --tasks is omitted
-        task_ids = sorted(
-            f.stem for f in tasks_dir.glob("*.json")
-        )
-        print(f"No --tasks specified, running all {len(task_ids)} tasks in {args.domain}")
+    # Build task list across all requested domains
     task_files = []
-    for tid in task_ids:
-        tf = tasks_dir / f"{tid}.json"
-        if not tf.exists():
-            parser.error(f"Task file not found: {tf}")
-        task_files.append(tf)
+    domain_for_task = {}  # Map task_file -> domain_name
+    
+    for domain in domains_to_run:
+        tasks_dir = domain_tasks_dir(domain)
+        if args.tasks:
+            # When --tasks is specified, only select matching tasks from THIS domain
+            task_ids = [t.strip() for t in args.tasks.split(",") if t.strip()]
+        else:
+            # Run all tasks in this domain
+            task_ids = sorted(f.stem for f in tasks_dir.glob("*.json"))
+        
+        domain_task_files = []
+        for tid in task_ids:
+            tf = tasks_dir / f"{tid}.json"
+            if tf.exists():
+                domain_task_files.append(tf)
+                domain_for_task[tf] = domain
+        
+        if domain_task_files:
+            print(f"Domain {domain}: {len(domain_task_files)} tasks")
+            task_files.extend(domain_task_files)
+    
+    if not task_files:
+        parser.error(f"No task files found. Check --domain and --tasks arguments.")
 
     # Lazily build the judge only if --score is on, so a missing key doesn't break runs
     judge = None
@@ -595,6 +651,9 @@ def main():
     overall_t0 = time.monotonic()
     results = []
     for i, task_file in enumerate(task_files, 1):
+        domain_name = domain_for_task[task_file]
+        tasks_dir_for_domain = domain_tasks_dir(domain_name)
+        
         result = run_task(
             task_file=task_file,
             output_dir=output_dir,
@@ -602,13 +661,13 @@ def main():
             memory_enabled=args.memory,
             anthropic_api_key=api_key,
             agent_id=args.agent_id,
-            domain_name=args.domain,
+            domain_name=domain_name,
         )
 
         # Score immediately so progress is captured even if a later task crashes
         if args.score and result.get("status") == "OK":
             try:
-                score_one(result, judge, tasks_dir, args.domain)
+                score_one(result, judge, tasks_dir_for_domain, domain_name)
             except Exception as e:
                 result["score"] = {"status": "ERR", "error": str(e)}
 

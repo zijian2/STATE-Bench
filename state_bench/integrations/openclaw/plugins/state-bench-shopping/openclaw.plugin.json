@@ -1,0 +1,42 @@
+{
+  "id": "state-bench-shopping",
+  "name": "STATE-Bench Shopping Assistant Tools",
+  "description": "Shopping assistant domain tools for STATE-Bench evaluation",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "tool_server_url": {
+        "type": "string",
+        "description": "URL of the tool execution server",
+        "default": "http://127.0.0.1:8765"
+      }
+    },
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "search_products",
+      "get_product_details",
+      "get_variants",
+      "get_customer_account",
+      "get_cart",
+      "check_compatibility",
+      "get_promotions",
+      "get_policies",
+      "validate_promo",
+      "add_to_cart",
+      "update_cart_item",
+      "remove_from_cart",
+      "apply_promo",
+      "remove_promo",
+      "redeem_loyalty_points",
+      "cancel_loyalty_redemption",
+      "get_shipping_options",
+      "set_shipping_option"
+    ]
+  }
+}
