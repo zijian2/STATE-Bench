@@ -316,8 +316,22 @@ def filter_runs_to_split(
     split_version: str,
     ignore_missing_runs: bool = False,
 ) -> tuple[list[dict[str, dict]], list[dict[str, object]]]:
-    """Filter loaded runs to a manifest split, requiring complete scored coverage."""
-    expected_task_ids = load_split_task_ids(domain, split, split_version)
+    """Filter loaded runs to a manifest split, requiring complete scored coverage.
+
+    Use ``domain="all"`` to merge expected task IDs across travel,
+    customer_support, and shopping_assistant manifests in one pass.
+    """
+    if domain == "all":
+        merged: list[str] = []
+        seen: set[str] = set()
+        for d in ("travel", "customer_support", "shopping_assistant"):
+            for tid in load_split_task_ids(d, split, split_version):
+                if tid not in seen:
+                    seen.add(tid)
+                    merged.append(tid)
+        expected_task_ids = merged
+    else:
+        expected_task_ids = load_split_task_ids(domain, split, split_version)
     expected = set(expected_task_ids)
     filtered_runs: list[dict[str, dict]] = []
     filtered_meta: list[dict[str, object]] = []
@@ -1025,7 +1039,13 @@ def print_comparison(
 
 def main():
     parser = argparse.ArgumentParser(description="Compute metrics from existing results")
-    parser.add_argument("--domain", type=str, default="travel", help="Domain name (default: travel)")
+    parser.add_argument(
+        "--domain",
+        type=str,
+        default="travel",
+        choices=["travel", "customer_support", "shopping_assistant", "all"],
+        help="Domain name (default: travel). Use 'all' to aggregate across travel/customer_support/shopping_assistant.",
+    )
     parser.add_argument("--results-dir", type=str, default=None, help="Results directory (default: outputs/<domain>)")
     parser.add_argument(
         "--split",

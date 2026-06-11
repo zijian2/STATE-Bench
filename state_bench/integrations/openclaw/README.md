@@ -116,12 +116,14 @@ Merges retry-run results into main summary:
 cd ./state_bench/integrations/openclaw/plugins/state-bench-travel
 openclaw plugins install --link .
 openclaw gateway restart
+
+## same as shopping and customer-support
 ```
 
 2. Enable plugin tools for your agent:
 ```bash
 # Add all 17 tools to agent config
-openclaw config set agents.list[0].tools.alsoAllow '["search_flights","get_user_details","get_user_reservations","get_booking","get_flight_status","get_policies","create_booking","update_booking","cancel_booking","search_hotels","book_hotel","get_hotel_reservation","cancel_hotel_reservation","search_car_rentals","book_car_rental","get_car_rental","cancel_car_rental"]'
+openclaw config set agents.list[0].tools.alsoAllow '["search_flights","get_user_details","get_user_reservations","get_booking","get_flight_status","get_policies","create_booking","update_booking","cancel_booking","search_hotels","book_hotel","get_hotel_reservation","cancel_hotel_reservation","search_car_rentals","book_car_rental","get_car_rental","cancel_car_rental","get_order","get_customer","search_products","get_product_details","get_warranty_status","process_return","process_refund","cancel_order","process_exchange","process_warranty_claim","get_variants","get_customer_account","get_cart","check_compatibility","get_promotions","validate_promo","add_to_cart","update_cart_item","remove_from_cart","apply_promo","remove_promo","redeem_loyalty_points","cancel_loyalty_redemption","get_shipping_options","set_shipping_option"]'
 openclaw gateway restart
 ```
 
@@ -140,8 +142,8 @@ The tool server must be running before starting the runner.
 
 ```bash
 cd /root/.openclaw/workspace/STATE-Bench
-. .venv/bin/activate
-nohup python -m state_bench.integrations.openclaw.tool_server > /tmp/tool_server.log 2>&1 &
+# . .venv/bin/activate
+nohup uv run  python -m state_bench.integrations.openclaw.tool_server > /tmp/tool_server.log 2>&1 &
 curl http://127.0.0.1:8765/health  # Verify it's running
 ```
 
@@ -149,16 +151,17 @@ curl http://127.0.0.1:8765/health  # Verify it's running
 
 **Run all tasks with memory + incremental scoring:**
 ```bash
-python -m state_bench.integrations.openclaw.runner \
-  --memory --score \
-  --agent-id state-bench \
-  --output-dir outputs/travel-full-vector
+# python -m state_bench.integrations.openclaw.runner \
+#   --memory --score \
+#   --agent-id state-bench \
+#   --output-dir outputs/travel-full-vector
 
 nohup uv run python -m state_bench.integrations.openclaw.runner \
---score \
---agent-id state-bench \
---output-dir outputs/travel-full-vector \
-> /tmp/state_bench_runner.log 2>&1 &
+  --memory \
+  --score \
+  --agent-id state-bench \
+  --output-dir outputs/all-domain \
+  > /tmp/state_bench_runner.log 2>&1 &
 ```
 
 **Run specific tasks:**
@@ -214,13 +217,17 @@ STATE-Bench's `compute_metrics` script provides aggregate analysis (task complet
 ```bash
 # 1. Adapt runner output to compute_metrics format
 python -m state_bench.integrations.openclaw.adapt_for_metrics \
-  --output-dir outputs/travel-full-vector --domain travel
+  --output-dir outputs/full-run \
+  --domain all \
+  --run-index 1
 
 # 2. Compute aggregate metrics
 python -m state_bench.scripts.compute_metrics \
-  --domain travel --results-dir outputs/travel-full-vector \
-  --num-runs 1 --output-dir outputs/travel-full-vector \
-  --ignore-missing-runs --verbose
+  --domain all \
+  --results-dir outputs/full-run \
+  --num-runs 1 \
+  --output-dir outputs/full-run \
+  --ignore-missing-runs
 ```
 
 **Output files:**

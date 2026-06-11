@@ -9,12 +9,17 @@ Writes:
 
 After conversion, run:
   python -m state_bench.scripts.compute_metrics \
-      --domain travel --results-dir outputs/<run-name> \
+      --domain all --results-dir outputs/<run-name> \
       --num-runs 1 --output-dir outputs/<run-name> --ignore-missing-runs
 
 Usage:
+  # Single domain
   python -m state_bench.integrations.openclaw.adapt_for_metrics \
-      --output-dir outputs/travel-full-vector [--domain travel] [--run-index 1]
+      --output-dir outputs/travel-full-vector --domain travel [--run-index 1]
+
+  # All domains (auto-detect domain per task)
+  python -m state_bench.integrations.openclaw.adapt_for_metrics \
+      --output-dir outputs/full-run --domain all [--run-index 1]
 """
 
 import argparse
@@ -23,7 +28,35 @@ from pathlib import Path
 
 from state_bench.scoring import evaluate_state_requirements
 from state_bench.schemas import StateDiff, TaskDefinition
-from state_bench.integrations.openclaw.runner import domain_tasks_dir
+from state_bench.paths import domain_tasks_dir
+
+ALL_DOMAINS = ("travel", "customer_support", "shopping_assistant")
+
+
+def _infer_domain_from_task_id(task_id: str, output_dir: Path) -> str:
+    """Infer the domain for a task_id without importing the runner.
+
+    Order of resolution:
+      1. Trajectory metadata.domain (if present)
+      2. First domain whose tasks/<task_id>.json exists
+      3. Fallback to 'travel'
+    """
+    traj_file = output_dir / task_id / "trajectory.json"
+    if traj_file.exists():
+        try:
+            with open(traj_file) as f:
+                traj = json.load(f)
+            domain = traj.get("metadata", {}).get("domain")
+            if domain:
+                return domain
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    for candidate in ALL_DOMAINS:
+        if (domain_tasks_dir(candidate) / f"{task_id}.json").exists():
+            return candidate
+
+    return "travel"
 
 
 def merge_traj_and_score(
@@ -109,10 +142,42 @@ def merge_traj_and_score(
     return out
 
 
+def _resolve_task_dirs(domain: str) -> dict[str, Path]:
+    """Return a mapping of domain -> tasks_dir for the requested domain selector."""
+    if domain == "all":
+        return {d: domain_tasks_dir(d) for d in ALL_DOMAINS}
+    return {domain: domain_tasks_dir(domain)}
+
+
+def _resolve_task_for_id(
+    task_id: str,
+    output_dir: Path,
+    domain_arg: str,
+    task_dirs: dict[str, Path],
+) -> tuple[str, Path]:
+    """Resolve (domain, task_file_path) for a given task_id.
+
+    For domain=='all', infer domain from trajectory metadata or filesystem.
+    For a single domain, use it directly.
+    """
+    if domain_arg == "all":
+        domain = _infer_domain_from_task_id(task_id, output_dir)
+    else:
+        domain = domain_arg
+    tasks_dir = task_dirs.get(domain) or domain_tasks_dir(domain)
+    return domain, tasks_dir / f"{task_id}.json"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Adapt OpenClaw runner output for compute_metrics")
     parser.add_argument("--output-dir", type=str, required=True, help="Runner output dir (contains summary.json and per-task subdirs)")
-    parser.add_argument("--domain", type=str, default="travel")
+    parser.add_argument(
+        "--domain",
+        type=str,
+        default="travel",
+        choices=["travel", "customer_support", "shopping_assistant", "all"],
+        help="Domain selector. Use 'all' to merge tasks across travel/customer_support/shopping_assistant (auto-detected per task).",
+    )
     parser.add_argument("--run-index", type=int, default=1, help="Write to run<N>/ subdir (default: 1)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing run dir contents")
     args = parser.parse_args()
@@ -125,13 +190,14 @@ def main():
     with open(summary_file) as f:
         summary = json.load(f)
 
-    tasks_dir = domain_tasks_dir(args.domain)
+    task_dirs = _resolve_task_dirs(args.domain)
     run_dir = output_dir / f"run{args.run_index}"
     run_dir.mkdir(exist_ok=True)
 
     written = 0
     skipped = 0
     errors = []
+    per_domain_counts: dict[str, int] = {}
 
     for result in summary.get("results", []):
         if result.get("status") != "OK":
@@ -146,7 +212,14 @@ def main():
         try:
             with open(traj_path) as f:
                 trajectory = json.load(f)
-            task_file = tasks_dir / f"{task_id}.json"
+            domain, task_file = _resolve_task_for_id(
+                task_id, output_dir, args.domain, task_dirs
+            )
+            if not task_file.exists():
+                errors.append(
+                    f"{task_id}: task definition not found under domain={domain} ({task_file})"
+                )
+                continue
             task = TaskDefinition.load(task_file)
             merged = merge_traj_and_score(
                 trajectory=trajectory,
@@ -161,10 +234,14 @@ def main():
             with open(out_path, "w") as f:
                 json.dump(merged, f, indent=2, ensure_ascii=False)
             written += 1
+            per_domain_counts[domain] = per_domain_counts.get(domain, 0) + 1
         except Exception as e:
             errors.append(f"{task_id}: {e}")
 
     print(f"[adapt] wrote {written} files to {run_dir}")
+    if per_domain_counts:
+        breakdown = ", ".join(f"{d}={c}" for d, c in sorted(per_domain_counts.items()))
+        print(f"[adapt] per-domain breakdown: {breakdown}")
     if skipped:
         print(f"[adapt] skipped {skipped} (status != OK)")
     if errors:
